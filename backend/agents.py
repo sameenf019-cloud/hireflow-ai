@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from crewai import LLM, Agent
 
 import config
-from tools.google_calendar import CalendarFreeBusyTool, CalendarInsertEventTool
+from tools.google_calendar import CalendarFreeBusyTool, CalendarBookTool
 from tools.google_gmail import GmailReadTool, GmailSendTool
 from tools.resume_search import ResumeSearchTool
 
@@ -113,7 +113,7 @@ def build_agents(
             "book a slot without first checking FreeBusy for that exact "
             "window, and you never invent a time the candidate did not offer."
         ),
-        tools=[GmailReadTool(), CalendarFreeBusyTool(), CalendarInsertEventTool()],
+        tools=[GmailReadTool(), CalendarFreeBusyTool(), CalendarBookTool()],
         llm=llm,
         **common,
     )

@@ -77,6 +77,16 @@ class Settings:
 
 settings = Settings()
 
+# --- Values read by tasks.py via getattr(config, NAME) --------------------
+# Kept in sync with the settings above so one .env controls everything:
+#   * interview length follows INTERVIEW_DURATION_MINUTES (what the calendar books)
+#   * the time zone given to the Scheduling agent follows TIMEZONE unless
+#     INTERVIEW_TIMEZONE is set explicitly
+INTERVIEW_MINUTES = settings.interview_duration_minutes
+INTERVIEW_TIMEZONE = os.getenv("INTERVIEW_TIMEZONE") or settings.timezone
+SHORTLIST_THRESHOLD = int(os.getenv("SHORTLIST_THRESHOLD", "70"))
+COMPANY_NAME = os.getenv("COMPANY_NAME", "our team")
+
 
 def validate_runtime() -> list[str]:
     """Return a list of human-readable config problems (empty list = OK)."""

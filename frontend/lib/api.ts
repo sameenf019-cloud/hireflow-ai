@@ -1,4 +1,4 @@
-import type { Candidate } from "@/lib/types";
+import type { Candidate, DemoStatus } from "@/lib/types";
 
 // Every browser call goes through the Next.js proxy (see next.config.mjs).
 const BASE = "/backend";
@@ -15,6 +15,10 @@ export const ENDPOINTS = {
   evaluationStream: (email: string) => `/candidates/${encodeURIComponent(email)}/evaluation/stream`,
   run: (runId: string) => `/runs/${runId}`,
   runEvents: (runId: string) => `/runs/${runId}/events`,
+  demoStatus: "/demo/status",
+  demoLoad: "/demo/load",
+  demoReply: "/demo/reply",
+  demoReset: "/demo/reset",
 } as const;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -97,12 +101,33 @@ export async function getRun(runId: string): Promise<{ run_id: string; kind: str
   return request(ENDPOINTS.run(runId));
 }
 
-// For `new EventSource(...)` in a component — live agent-handoff feed
+// For `new EventSource(...)` in a component - live agent-handoff feed
 export function runEventsUrl(runId: string): string {
   return `${BASE}${ENDPOINTS.runEvents(runId)}`;
 }
 
-// For `new EventSource(...)` — word-by-word evaluation summary stream
+// For `new EventSource(...)` - word-by-word evaluation summary stream
 export function evaluationStreamUrl(email: string): string {
   return `${BASE}${ENDPOINTS.evaluationStream(email)}`;
+}
+
+// ---- Sample-data (demo) mode: lets judges test without their own files ----
+
+export async function getDemoStatus(): Promise<DemoStatus> {
+  return request(ENDPOINTS.demoStatus);
+}
+
+// Load the sample job description + sample candidates
+export async function loadDemo(): Promise<{ ok: boolean; added: number; note?: string }> {
+  return request(ENDPOINTS.demoLoad, { method: "POST" });
+}
+
+// Simulate every emailed candidate replying with an interview time
+export async function simulateDemoReply(): Promise<{ ok: boolean; replied: string[]; message: string }> {
+  return request(ENDPOINTS.demoReply, { method: "POST" });
+}
+
+// Remove the sample candidates so the demo can be run again
+export async function resetDemo(): Promise<{ ok: boolean; removed: number }> {
+  return request(ENDPOINTS.demoReset, { method: "POST" });
 }

@@ -32,3 +32,10 @@ export interface EvaluationResult {
   recommendation: "HIRE" | "REJECT";
   summary: string;
 }
+
+// Sample-data (demo) mode, reported by GET /demo/status
+export interface DemoStatus {
+  available: boolean; // true only when the backend runs in mock mode
+  loaded: boolean; // true when all sample candidates are already loaded
+  candidates: number;
+}

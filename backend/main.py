@@ -16,6 +16,13 @@ GET  /runs/{run_id}                     run status + results
 GET  /runs/{run_id}/events              Server-Sent Events: live agent-handoff feed
 GET  /candidates/{email}/evaluation/stream   SSE: final summary word by word
 
+Demo mode (GOOGLE_MOCK_MODE=true only)
+GET  /demo/status                       is demo available / are samples loaded
+POST /demo/load                         load sample job description + sample candidates
+POST /demo/reply                        simulate replies (a different time per candidate)
+POST /demo/reset                        remove sample candidates, their mock emails
+                                        AND their mock calendar events
+
 Runs execute in a worker thread (CrewAI is blocking) and are serialised by a
 global lock: one pipeline run at a time keeps SQLite writes and Groq rate
 limits predictable.
@@ -39,6 +46,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -54,6 +62,7 @@ from pydantic import BaseModel
 
 import config
 import orchestrator as orch
+import demo_data
 import rag_engine
 import state_manager as sm
 
@@ -71,15 +80,38 @@ JOBS_DIR = DATA_DIR / "jobs"
 # Adapter block
 # ==========================================================================
 def _extract_text(filename: str, data: bytes) -> str:
-    return rag_engine.extract_text(filename, data)
+    """rag_engine.extract_text wants a file path, so write the upload to a temp file first."""
+    suffix = Path(filename).suffix.lower() or ".txt"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        return rag_engine.extract_text(tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
-def _index_resume(email: str, text: str, filename: str) -> int:
-    return rag_engine.index_resume(email, text, filename)
+def _current_job_id() -> int:
+    """Latest job row in SQLite (newest first); creates an empty one if no JD was uploaded yet."""
+    jobs = sm.list_jobs()
+    if jobs:
+        return jobs[0]["id"]
+    return sm.create_job(title="Unassigned", jd_text="", filename=None)
 
 
-def _create_candidate(email: str, name: Optional[str], filename: str) -> None:
-    sm.create_candidate(email, name=name, resume_filename=filename)
+def _create_candidate(email: str, name: Optional[str], filename: str, text: str) -> Tuple[int, int]:
+    job_id = _current_job_id()
+    cand_id = sm.create_candidate(
+        job_id=job_id, email=email, resume_text=text, name=name, resume_filename=filename
+    )
+    return cand_id, job_id
+
+
+def _index_resume(candidate_id: int, job_id: int, email: str, text: str, filename: str) -> int:
+    return rag_engine.index_resume(candidate_id, job_id, email, text, filename)
 
 
 def _email_of(cand: dict) -> str:
@@ -210,13 +242,66 @@ def _find_email(text: str) -> Optional[str]:
     return match.group(0).lower() if match else None
 
 
+# Lines that look like a name but are really a section heading or a job title.
+_NOT_NAME_LINES = {
+    "professional summary", "summary", "profile", "career objective", "objective",
+    "personal statement", "about me", "contact", "contact information", "curriculum vitae",
+    "resume", "cv", "experience", "work experience", "professional experience",
+    "employment history", "education", "skills", "technical skills", "key skills",
+    "core skills", "projects", "certifications", "languages", "references",
+    "achievements", "awards", "interests", "hobbies",
+}
+# If any word of a line is one of these, the line is a job title, not a person's name.
+_ROLE_WORDS = {
+    "developer", "engineer", "designer", "editor", "analyst", "manager", "consultant",
+    "specialist", "architect", "administrator", "scientist", "intern", "officer",
+    "executive", "assistant", "lead", "director", "programmer", "technician",
+    "summary", "experience", "education", "skills", "projects", "objective", "profile",
+}
+_NAME_LINE_RE = re.compile(r"[A-Za-z][A-Za-z.'\-]*(?: [A-Za-z][A-Za-z.'\-]*){1,3}")
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z.'\-]*")
+
+
+def _looks_like_name(line: str) -> bool:
+    low = line.lower().strip()
+    if low in _NOT_NAME_LINES:
+        return False
+    if any(w in _ROLE_WORDS for w in re.findall(r"[a-z]+", low)):
+        return False
+    return bool(_NAME_LINE_RE.fullmatch(line)) and 2 <= len(line.split()) <= 4
+
+
+def _name_from_filename(filename: str) -> str:
+    stem = re.sub(r"[_\-\.]+", " ", Path(filename).stem)
+    words = [w for w in stem.split() if w.lower() not in {"resume", "cv", "curriculum", "vitae", "final", "new"}]
+    return " ".join(words).title() or "Candidate"
+
+
 def _guess_name(text: str, filename: str) -> str:
-    """First short alphabetic line of the resume, else the file name."""
-    for line in (text or "").splitlines()[:5]:
-        line = line.strip()
-        if 2 <= len(line.split()) <= 4 and re.fullmatch(r"[A-Za-z.'\- ]+", line):
+    """
+    Best-effort candidate name from the first lines of the resume text.
+
+    1. First line of 2-4 alphabetic words that is not a section heading or job title.
+    2. Two (or three) consecutive one-word lines, for PDFs whose extractor splits
+       a large name across lines ("Arooj" / "Fatima").
+    3. The file name, minus words like "resume" and "cv".
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()][:12]
+    log.info("Name guess for %s: first lines=%r", filename, lines[:6])
+
+    for line in lines:
+        if _looks_like_name(line):
             return line.title()
-    return re.sub(r"[_\-]+", " ", Path(filename).stem).title()
+
+    for i in range(len(lines) - 1):
+        for size in (2, 3):
+            chunk = lines[i:i + size]
+            if len(chunk) == size and all(_WORD_RE.fullmatch(w) for w in chunk):
+                joined = " ".join(chunk)
+                if _looks_like_name(joined):
+                    return joined.title()
+
+    return _name_from_filename(filename)
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -235,13 +320,16 @@ def _public(cand: dict) -> dict:
     """Candidate row with the stored JSON blobs parsed for the frontend."""
     out = dict(cand)
     for key in ("screening_json", "evaluation_json"):
-        raw = out.pop(key, None)
-        out[key.replace("_json", "")] = json.loads(raw) if raw else None
+        raw = out.pop(key, None)  # state_manager already parsed it; accept both forms
+        out[key.replace("_json", "")] = json.loads(raw) if isinstance(raw, str) else (raw or None)
+    out.pop("resume_text", None)  # large, and the frontend does not need it
+    out["candidate_email"] = out.get("email")
+    out["candidate_name"] = out.get("name")
     return out
 
 
 def _candidate_or_404(email: str) -> dict:
-    cand = sm.get_candidate(email.lower())
+    cand = sm.get_candidate_by_email(email)
     if not cand:
         raise HTTPException(404, f"Unknown candidate: {email}")
     return cand
@@ -271,6 +359,8 @@ async def upload_job(file: UploadFile = File(...)) -> dict:
     if not text.strip():
         raise HTTPException(422, "Could not extract any text from the job description")
     job_id = _save_jd(text)
+    title = Path(file.filename or "Job").stem.replace("_", " ").strip() or "Job"
+    sm.create_job(title=title, jd_text=text, filename=file.filename)
     return {"job_id": job_id, "filename": file.filename, "chars": len(text)}
 
 
@@ -297,14 +387,14 @@ async def upload_resumes(
             if not cand_email:
                 raise ValueError("no email address found in the resume; send it in the `email` field")
 
-            if sm.get_candidate(cand_email):
+            if sm.get_candidate_by_email(cand_email):
                 results.append({"filename": name, "ok": True, "email": cand_email,
                                 "note": "already ingested, skipped"})
                 continue
 
             cand_name = _guess_name(text, name)
-            _create_candidate(cand_email, cand_name, name)
-            chunks = await asyncio.to_thread(_index_resume, cand_email, text, name)
+            cand_id, job_id = _create_candidate(cand_email, cand_name, name, text)
+            chunks = await asyncio.to_thread(_index_resume, cand_id, job_id, cand_email, text, name)
             results.append({"filename": name, "ok": True, "email": cand_email,
                             "name": cand_name, "chunks_indexed": chunks,
                             "status": orch.Status.PENDING_SCREENING})
@@ -375,6 +465,126 @@ def evaluate(email: str, body: EvaluateRequest) -> dict:
     return {"run_id": run_id, "events_url": f"/runs/{run_id}/events"}
 
 
+
+# ==========================================================================
+# Demo mode (sample data for hackathon judges). Mock mode only: the sample
+# candidates use @example.com addresses, so real mode would bounce emails.
+# ==========================================================================
+# Each simulated reply asks for a different time on the same day, so two
+# shortlisted sample candidates never fight for the same calendar slot.
+_DEMO_REPLY_TIMES = ["2:00 PM", "3:00 PM", "4:00 PM", "5:00 PM"]
+
+
+def _demo_enabled() -> bool:
+    return bool(config.settings.google_mock_mode)
+
+
+def _require_demo() -> None:
+    if not _demo_enabled():
+        raise HTTPException(
+            403,
+            "Sample data runs in demo mode only. Set GOOGLE_MOCK_MODE=true (no real emails are sent in demo mode).",
+        )
+
+
+def _clear_demo_calendar() -> int:
+    """Delete mock calendar events whose attendees are sample (demo) candidates.
+    Other events (for example a real test candidate's) are left alone."""
+    from tools.google_calendar import _mock_cal
+
+    demo = {e.lower() for e in demo_data.DEMO_EMAILS}
+
+    def drop(data: dict) -> int:
+        events = data.get("events", [])
+        keep = [
+            ev for ev in events
+            if not ({str(a).lower() for a in ev.get("attendees", [])} & demo)
+        ]
+        data["events"] = keep
+        return len(events) - len(keep)
+
+    result = _mock_cal.update(drop)
+    return result if isinstance(result, int) else 0
+
+
+@app.get("/demo/status")
+def demo_status() -> dict:
+    loaded = [e for e in demo_data.DEMO_EMAILS if sm.get_candidate_by_email(e)]
+    return {
+        "available": _demo_enabled(),
+        "loaded": len(loaded) == len(demo_data.DEMO_EMAILS),
+        "candidates": len(demo_data.DEMO_RESUMES),
+    }
+
+
+@app.post("/demo/load")
+async def demo_load() -> dict:
+    """Load the sample job description and sample candidates (no files needed)."""
+    _require_demo()
+    missing = [r for r in demo_data.DEMO_RESUMES if not sm.get_candidate_by_email(r["email"])]
+    if not missing:
+        return {"ok": True, "added": 0, "note": "Sample candidates are already loaded."}
+    jd = demo_data.DEMO_JOB_DESCRIPTION
+    _save_jd(jd)  # newest JD file wins when the pipeline runs
+    sm.create_job(title=demo_data.DEMO_JOB_TITLE, jd_text=jd, filename="sample_job_description.txt")
+    added = []
+    for r in missing:
+        cand_id, job_id = _create_candidate(r["email"], r["name"], r["filename"], r["text"])
+        await asyncio.to_thread(_index_resume, cand_id, job_id, r["email"], r["text"], r["filename"])
+        added.append(r["email"])
+    return {"ok": True, "added": len(added), "emails": added}
+
+
+@app.post("/demo/reply")
+def demo_reply() -> dict:
+    """Simulate every emailed candidate replying with a specific interview time."""
+    _require_demo()
+    from tools.google_gmail import mock_inject_reply
+
+    waiting = sm.list_candidates(status="EMAILED_PENDING_REPLY")
+    if not waiting:
+        raise HTTPException(409, "No candidate is waiting for a reply. Run 'Screen and email candidates' first.")
+    base_body = demo_data.demo_reply_text()
+    replied = []
+    for cand in waiting:
+        addr = _email_of(cand)
+        # Give each candidate their own hour (2 PM, 3 PM, ...) to avoid slot clashes.
+        hour = _DEMO_REPLY_TIMES[len(replied) % len(_DEMO_REPLY_TIMES)]
+        body = base_body.replace("2:00 PM", hour)
+        try:
+            mock_inject_reply(addr, body)
+            replied.append(addr)
+        except Exception as exc:  # e.g. a candidate emailed in real mode has no mock thread
+            log.warning("Could not simulate a reply for %s: %s", addr, exc)
+    if not replied:
+        raise HTTPException(409, "No candidate has a demo email thread to reply to.")
+    return {"ok": True, "replied": replied, "message": base_body}
+
+
+@app.post("/demo/reset")
+def demo_reset() -> dict:
+    """Remove the sample candidates, their mock emails and their mock calendar
+    events so the demo can be run again from the start."""
+    _require_demo()
+    removed = 0
+    with sm.get_conn() as conn:
+        for email in demo_data.DEMO_EMAILS:
+            removed += conn.execute("DELETE FROM candidates WHERE email = ?", (email,)).rowcount
+    from tools.google_gmail import _mock_mail
+
+    demo = {e.lower() for e in demo_data.DEMO_EMAILS}
+
+    def drop(data: dict) -> None:
+        data["messages"] = [
+            m for m in data["messages"]
+            if m.get("to", "").lower() not in demo and m.get("from", "").lower() not in demo
+        ]
+
+    _mock_mail.update(drop)
+    events_removed = _clear_demo_calendar()
+    return {"ok": True, "removed": removed, "calendar_events_removed": events_removed}
+
+
 @app.get("/runs/{run_id}")
 def get_run(run_id: str) -> dict:
     run = RUNS.get(run_id)
@@ -424,7 +634,7 @@ async def stream_evaluation(email: str, request: Request, delay: float = 0.04) -
     raw = cand.get("evaluation_json")
     if not raw:
         raise HTTPException(404, "No evaluation yet for this candidate")
-    evaluation = json.loads(raw)
+    evaluation = json.loads(raw) if isinstance(raw, str) else raw
     delay = min(max(delay, 0.0), 0.5)
 
     async def stream():

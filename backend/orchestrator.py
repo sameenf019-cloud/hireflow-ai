@@ -12,33 +12,30 @@ and decides which agent(s) run. Key rule for the reschedule edge case:
        ONLY (Screening/Outreach are bypassed): old event is cancelled, a new
        one is booked, status resets to INTERVIEW_SCHEDULED.
 
+Outreach: the Outreach agent only WRITES the email. This module sends it with
+plain Python (tools.google_gmail.send_email), so "EMAIL_SENT" is only recorded
+when the send really succeeded.
+
+Scheduling: the Scheduling agent only READS the candidate's reply and
+proposes time(s) as plain JSON text (no tools, and NO output_pydantic - CrewAI's
+pydantic converter uses instructor tool-calling, which Groq models fail with
+"Tool choice is required, but model did not call a tool"). This module parses
+that JSON itself (_parse_proposal), checks FreeBusy and books the event with
+plain Python (tools.google_calendar), bypassing google_calendar.book_interview()
+because it calls a state_manager.set_calendar_event() function that does not
+exist; the actual SQLite write happens here via _set_fields/_set_status instead.
+
 All run_* functions are blocking (CrewAI kickoff is sync). In FastAPI call
 them via asyncio.to_thread / BackgroundTasks. Pass on_event to receive
 live progress dicts for the frontend agent-handoff visualizer.
-
-------------------------------------------------------------------------
-ASSUMED INTERFACES (adapt the small adapter block below if yours differ)
-------------------------------------------------------------------------
-state_manager:
-    get_candidate(email) -> dict | None
-    list_candidates(status=None) -> list[dict]
-    update_status(email, status)
-    update_candidate_fields(email, **fields)
-  candidate columns used: name, status, screening_json, evaluation_json,
-    emailed_at, scheduled_at, calendar_event_id, calendar_event_link,
-    last_reply_id
-tools.google_gmail:
-    fetch_replies(candidate_email, since_iso=None) -> list[dict]
-      each dict: id, subject, from, received_at (ISO 8601)
-tools.google_calendar:
-    cancel_event(event_id) -> None   (must treat 404/410 "already gone" as success)
 """
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -53,6 +50,7 @@ from schemas import (
     SchedulingSchema,
 )
 from tasks import (
+    SchedulingProposalSchema,
     evaluation_task,
     outreach_task,
     scheduling_task,
@@ -77,7 +75,7 @@ class Status:
 # Adapter block — the only place that touches state_manager / Google modules
 # ==========================================================================
 def _get(email: str) -> Optional[dict]:
-    return sm.get_candidate(email)
+    return sm.get_candidate_by_email(email)
 
 
 def _list(status: Optional[str] = None) -> List[dict]:
@@ -85,17 +83,22 @@ def _list(status: Optional[str] = None) -> List[dict]:
 
 
 def _set_status(email: str, status: str) -> None:
-    sm.update_status(email, status)
+    cand = _require(email)
+    sm.update_status(cand["id"], status, force=True)
 
 
 def _set_fields(email: str, **fields: Any) -> None:
-    sm.update_candidate_fields(email, **fields)
+    cand = _require(email)
+    sm.update_candidate_fields(cand["id"], **fields)
 
 
 def _fetch_replies(email: str, since_iso: Optional[str]) -> List[dict]:
     from tools import google_gmail
 
-    return google_gmail.fetch_replies(email, since_iso=since_iso)
+    # Real function is fetch_candidate_messages(email) — no since_iso param.
+    # Filtering old replies already happens in _latest_real_reply using each
+    # reply's "received_at" field.
+    return google_gmail.fetch_candidate_messages(email)
 
 
 def _cancel_event(event_id: str) -> None:
@@ -163,6 +166,41 @@ def _parse_output(task: Task, schema: Any) -> Optional[Any]:
     return None
 
 
+def _parse_proposal(task: Task, candidate_email: str) -> Optional[SchedulingProposalSchema]:
+    """
+    Parse the Scheduling agent's raw text ourselves. The scheduling task has no
+    output_pydantic, so CrewAI/instructor never gets involved (that was the
+    source of the Groq "Tool choice is required" error).
+
+    Status is derived from proposed_times, not trusted from the model.
+    """
+    out = getattr(task, "output", None)
+    raw = (getattr(out, "raw", "") or "").strip()
+    log.info("Scheduling agent raw output: %s", raw[:600])
+
+    match = re.search(r"\{.*\}", raw, re.DOTALL)  # tolerate code fences / prose
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        log.warning("Scheduling agent output was not valid JSON: %s", raw[:300])
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    times = data.get("proposed_times") or []
+    if isinstance(times, str):
+        times = [times]
+    times = [str(t).strip() for t in times if t and str(t).strip()]
+
+    return SchedulingProposalSchema(
+        candidate_email=candidate_email,
+        proposed_times=times,
+        status="HAS_TIMES" if times else "NEEDS_CLARIFICATION",
+    )
+
+
 def _kickoff(agents_list: list, tasks_list: list) -> None:
     Crew(
         agents=agents_list,
@@ -182,6 +220,42 @@ def _result(ok: bool, email: str, status: str, result: Any = None,
         "error": error,
         "note": note,
     }
+
+
+def _send_outreach_email(candidate_email: str, email_draft: str) -> bool:
+    """
+    Send the email the Outreach agent wrote, using plain Python (no LLM tool call).
+    The draft's first line is "Subject: ...", then a blank line, then the body.
+    Returns True only if the send really succeeded.
+    """
+    from tools import google_gmail
+
+    cand = _require(candidate_email)
+    address = cand.get("email") or candidate_email
+    if address.endswith(".invalid"):
+        log.warning("No valid email address on file for %s", candidate_email)
+        return False
+
+    draft = (email_draft or "").strip()
+    subject = "Interview invitation"
+    body = draft
+    match = re.match(r"^\s*subject:\s*(.+?)\s*\n+(.*)$", draft, re.IGNORECASE | re.DOTALL)
+    if match:
+        subject, body = match.group(1).strip(), match.group(2).strip()
+    if not body:
+        log.warning("Outreach draft was empty for %s", candidate_email)
+        return False
+
+    try:
+        result = google_gmail.send_email(address, subject, body, thread_id=cand.get("gmail_thread_id"))
+        # state_manager has no set_gmail_thread_id function.
+        # update_candidate_fields is the real function that stores it.
+        sm.update_candidate_fields(cand["id"], gmail_thread_id=result["thread_id"])
+        sm.log_event("Outreach Agent", f"Emailed {cand.get('name') or address}", cand["id"])
+        return True
+    except Exception:
+        log.exception("Sending outreach email to %s failed", address)
+        return False
 
 
 # --- Gmail reply filtering -------------------------------------------------
@@ -249,7 +323,8 @@ def run_intake(candidate_email: str, jd_text: str, on_event: EventCb = None) -> 
         parsed = getattr(output, "pydantic", None)
         if parsed is None:
             return
-        _set_fields(candidate_email, screening_json=parsed.model_dump_json())
+        _set_fields(candidate_email, screening_json=parsed.model_dump_json(),
+                    match_score=parsed.match_score)
         _set_status(candidate_email, Status.SCREENED)
         state["shortlisted"] = parsed.screening_decision == "SHORTLIST"
         _emit(on_event, "screening", "Screening Agent",
@@ -266,13 +341,13 @@ def run_intake(candidate_email: str, jd_text: str, on_event: EventCb = None) -> 
         parsed = getattr(output, "pydantic", None)
         if parsed is None:
             return
-        sent = parsed.action_taken.upper().startswith("EMAIL_SENT")
+        sent = _send_outreach_email(candidate_email, parsed.email_draft)
         if sent:
             _set_fields(candidate_email, emailed_at=_now_iso())
             _set_status(candidate_email, Status.EMAILED_PENDING_REPLY)
         _emit(on_event, "outreach", "Outreach Agent",
               "Email sent." if sent else "Email send failed - candidate stays SCREENED.",
-              action_taken=parsed.action_taken)
+              action_taken="EMAIL_SENT" if sent else "SEND_FAILED")
 
     s_task = screening_task(agents["screening"], candidate_email, jd_text, callback=on_screened)
     o_task = outreach_task(
@@ -303,12 +378,13 @@ def run_intake(candidate_email: str, jd_text: str, on_event: EventCb = None) -> 
 
 def run_outreach_only(candidate_email: str, on_event: EventCb = None) -> dict:
     """Retry a failed send for a SCREENED + SHORTLIST candidate (no re-screening)."""
-    import json
-
     cand = _require(candidate_email)
     if not cand.get("screening_json"):
         return _result(False, candidate_email, cand["status"], error="No screening result on file")
-    screening = CandidateScreeningSchema.model_validate(json.loads(cand["screening_json"]))
+    raw_screening = cand["screening_json"]  # state_manager already returns it parsed
+    screening = CandidateScreeningSchema.model_validate(
+        json.loads(raw_screening) if isinstance(raw_screening, str) else raw_screening
+    )
     if screening.screening_decision != "SHORTLIST":
         return _result(True, candidate_email, cand["status"], note="Candidate was not shortlisted")
 
@@ -323,7 +399,7 @@ def run_outreach_only(candidate_email: str, on_event: EventCb = None) -> dict:
         return _result(False, candidate_email, cand["status"], error=str(exc))
 
     out = _parse_output(task, OutreachSchema)
-    if out and out.action_taken.upper().startswith("EMAIL_SENT"):
+    if out and _send_outreach_email(candidate_email, out.email_draft):
         _set_fields(candidate_email, emailed_at=_now_iso())
         _set_status(candidate_email, Status.EMAILED_PENDING_REPLY)
         _emit(on_event, "outreach", "Outreach Agent", "Email sent.")
@@ -333,7 +409,8 @@ def run_outreach_only(candidate_email: str, on_event: EventCb = None) -> dict:
 
 
 # ==========================================================================
-# Stage 4 — Scheduling (initial booking AND reschedule; Scheduling Agent only)
+# Stage 4 — Scheduling (initial booking AND reschedule; Scheduling Agent only
+# extracts proposed times; FreeBusy + booking happen here in plain Python)
 # ==========================================================================
 def run_scheduling(candidate_email: str, on_event: EventCb = None,
                    reschedule: bool = False) -> dict:
@@ -344,6 +421,11 @@ def run_scheduling(candidate_email: str, on_event: EventCb = None,
 
     if reply is None:
         return _result(True, candidate_email, fallback_status, note="No new reply to process")
+
+    # DEBUG: confirms the reply really has a body the agent can read.
+    log.info("Reply for %s: keys=%s subject=%r body_len=%d",
+             candidate_email, list(reply.keys()), reply.get("subject"),
+             len(reply.get("body") or ""))
 
     # --- Reschedule step 1: cancel the old event deterministically (no LLM) ---
     if reschedule:
@@ -364,12 +446,15 @@ def run_scheduling(candidate_email: str, on_event: EventCb = None,
             _emit(on_event, "scheduling", "Scheduling Agent",
                   "No previous event id on file; booking a new slot anyway.")
 
-    # --- Step 2: Scheduling Agent books the new slot ---
+    # --- Step 2: Scheduling Agent reads the reply and proposes time(s). No
+    # tools and no output_pydantic, so neither the Groq tool-call error nor
+    # the instructor converter error can happen here. ---
     agents = build_agents()
     task = scheduling_task(
         agents["scheduling"], candidate_email,
+        reply_body=reply.get("body", ""),
         now_iso=_now_iso(), reschedule=reschedule,
-        candidate_name=cand.get("name"), role_title=cand.get("role_title"),
+        candidate_name=cand.get("name"),
     )
     _emit(on_event, "scheduling", "Scheduling Agent",
           f"Reading {candidate_email}'s reply and checking calendar availability...")
@@ -380,36 +465,84 @@ def run_scheduling(candidate_email: str, on_event: EventCb = None,
         _emit(on_event, "error", "Scheduling Agent", f"Scheduling failed: {exc}")
         return _result(False, candidate_email, fallback_status, error=str(exc))
 
-    out = _parse_output(task, SchedulingSchema)
-    if out is None:
+    proposal = _parse_proposal(task, candidate_email)
+    if proposal is None:
         _emit(on_event, "error", "Scheduling Agent", "No valid scheduling output was produced.")
         return _result(False, candidate_email, fallback_status, error="No valid output")
 
-    out.candidate_email = candidate_email
+    valid_times: List[datetime] = []
+    if proposal.status == "HAS_TIMES":
+        from tools import google_calendar
 
-    if out.status.upper() == "SCHEDULED" and out.calendar_event_link:
-        _set_fields(
-            candidate_email,
-            calendar_event_link=out.calendar_event_link,
-            calendar_event_id=_event_id_from_link(out.calendar_event_link),
-            scheduled_at=_now_iso(),
-            last_reply_id=reply.get("id"),
-        )
-        _set_status(candidate_email, Status.INTERVIEW_SCHEDULED)
-        _emit(on_event, "scheduling", "Scheduling Agent",
-              f"Interview booked for {out.agreed_timestamp}.",
-              agreed_timestamp=out.agreed_timestamp,
-              calendar_event_link=out.calendar_event_link)
-        return _result(True, candidate_email, Status.INTERVIEW_SCHEDULED, out)
+        for t in proposal.proposed_times:
+            try:
+                dt = google_calendar.parse_iso(t)
+            except ValueError:
+                log.warning("Could not parse proposed time %r", t)
+                continue
+            if dt > datetime.now(timezone.utc):
+                valid_times.append(dt)
+            else:
+                log.info("Ignoring proposed time in the past: %s", t)
 
-    # NO_REPLY / NEEDS_CLARIFICATION / NO_SLOT: remember we handled this reply
-    # so the poller doesn't re-run the agent on it every tick. Status is left
-    # alone (a failed reschedule stays RESCHEDULE_REQUESTED).
-    if out.status.upper() != "NO_REPLY":
+    if not valid_times:
+        out = SchedulingSchema(candidate_email=candidate_email, agreed_timestamp="",
+                               calendar_event_link="", status="NEEDS_CLARIFICATION")
         _set_fields(candidate_email, last_reply_id=reply.get("id"))
+        _emit(on_event, "scheduling", "Scheduling Agent",
+              "Not scheduled yet: NEEDS_CLARIFICATION.", status="NEEDS_CLARIFICATION")
+        return _result(True, candidate_email, fallback_status, out, note="NEEDS_CLARIFICATION")
+
+    # --- Step 3: plain Python checks FreeBusy and books the first free slot
+    # (no LLM tool call - this is the deterministic part that broke before) ---
+    from config import settings
+    from tools import google_calendar
+
+    booking: Optional[dict] = None
+    for start in valid_times:
+        end = start + timedelta(minutes=settings.interview_duration_minutes)
+        free, _conflicts = google_calendar.is_slot_free(start, end)
+        if free:
+            who = cand.get("name") or candidate_email
+            title = f"Interview: {who}"
+            if cand.get("role_title"):
+                title += f" - {cand['role_title']}"
+            created = google_calendar.create_event(
+                summary=title,
+                description=f"Interview with {who} ({candidate_email}).",
+                start=start, end=end,
+                attendees=[candidate_email],
+            )
+            booking = {"agreed_timestamp": start.isoformat(), **created}
+            break
+
+    if booking is None:
+        out = SchedulingSchema(candidate_email=candidate_email, agreed_timestamp="",
+                               calendar_event_link="", status="NO_SLOT")
+        _set_fields(candidate_email, last_reply_id=reply.get("id"))
+        _emit(on_event, "scheduling", "Scheduling Agent",
+              "Not scheduled yet: NO_SLOT.", status="NO_SLOT")
+        return _result(True, candidate_email, fallback_status, out, note="NO_SLOT")
+
+    out = SchedulingSchema(
+        candidate_email=candidate_email,
+        agreed_timestamp=booking["agreed_timestamp"],
+        calendar_event_link=booking.get("event_link") or "",
+        status="SCHEDULED",
+    )
+    _set_fields(
+        candidate_email,
+        calendar_event_link=out.calendar_event_link,
+        calendar_event_id=booking.get("event_id"),
+        scheduled_at=_now_iso(),
+        last_reply_id=reply.get("id"),
+    )
+    _set_status(candidate_email, Status.INTERVIEW_SCHEDULED)
     _emit(on_event, "scheduling", "Scheduling Agent",
-          f"Not scheduled yet: {out.status}.", status=out.status)
-    return _result(True, candidate_email, fallback_status, out, note=out.status)
+          f"Interview booked for {out.agreed_timestamp}.",
+          agreed_timestamp=out.agreed_timestamp,
+          calendar_event_link=out.calendar_event_link)
+    return _result(True, candidate_email, Status.INTERVIEW_SCHEDULED, out)
 
 
 # ==========================================================================
@@ -422,10 +555,14 @@ def run_evaluation(candidate_email: str, jd_text: str, interview_notes: str,
         return _result(False, candidate_email, cand["status"],
                        error="No screening result on file; run screening first")
 
+    screening_json = cand["screening_json"]
+    if not isinstance(screening_json, str):  # state_manager returns it already parsed
+        screening_json = json.dumps(screening_json)
+
     agents = build_agents()
     task = evaluation_task(
         agents["evaluator"], candidate_email, jd_text,
-        cand["screening_json"], interview_notes,
+        screening_json, interview_notes,
     )
     _emit(on_event, "evaluation", "Evaluator Agent",
           f"Weighing screening results against interview notes for {candidate_email}...")

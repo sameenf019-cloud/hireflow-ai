@@ -20,3 +20,7 @@ node_modules/
 .next/
 next-env.d.ts
 *.tsbuildinfo
+backup_before_demo/
+combined_files.txt
+fix_names.py
+main (1).py

@@ -1,10 +1,11 @@
 "use client";
 
 import { useId, useState } from "react";
-import { FileText, Files, Loader2 } from "lucide-react";
+import { FileText, Files, FlaskConical, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { uploadJob, uploadResumes } from "@/lib/api";
+import { loadDemo, uploadJob, uploadResumes } from "@/lib/api";
+import type { DemoStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const ACCEPT = ".pdf,.docx";
@@ -78,14 +79,17 @@ function DropZone({
 
 export function UploadPanel({
   disabled,
+  demo,
   onUploaded,
 }: {
   disabled?: boolean;
+  demo?: DemoStatus | null;
   onUploaded: () => void | Promise<void>;
 }) {
   const [jd, setJd] = useState<File[]>([]);
   const [resumes, setResumes] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  const [demoBusy, setDemoBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [resetKey, setResetKey] = useState(0);
@@ -96,7 +100,7 @@ export function UploadPanel({
     setError(null);
     setNote(null);
     try {
-            await uploadJob(jd[0]);
+      await uploadJob(jd[0]);
       await uploadResumes(resumes);
       setNote(`Ingested ${resumes.length} resume${resumes.length === 1 ? "" : "s"}.`);
       setJd([]);
@@ -109,6 +113,27 @@ export function UploadPanel({
       setBusy(false);
     }
   }
+
+  async function useSampleData() {
+    setDemoBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await loadDemo();
+      setNote(
+        result.added > 0
+          ? `Loaded a sample job description and ${result.added} sample candidates. Next: click "Screen and email candidates".`
+          : "Sample data is already loaded."
+      );
+      await onUploaded();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not load sample data.");
+    } finally {
+      setDemoBusy(false);
+    }
+  }
+
+  const working = busy || demoBusy;
 
   return (
     <Card>
@@ -138,11 +163,33 @@ export function UploadPanel({
         <Button
           className="w-full"
           onClick={submit}
-          disabled={disabled || busy || jd.length === 0 || resumes.length === 0}
+          disabled={disabled || working || jd.length === 0 || resumes.length === 0}
         >
           {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
           {busy ? "Uploading" : "Upload and ingest"}
         </Button>
+
+        {demo?.available && (
+          <div className="space-y-2 border-t border-white/10 pt-3">
+            <p className="text-sm text-mute">
+              No files? Load a sample job description and {demo.candidates} sample candidates to try the full pipeline.
+            </p>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={useSampleData}
+              disabled={disabled || working || demo.loaded}
+            >
+              {demoBusy ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+              ) : (
+                <FlaskConical className="h-4 w-4" aria-hidden />
+              )}
+              {demo.loaded ? "Sample data loaded" : "Try with sample data"}
+            </Button>
+          </div>
+        )}
+
         {note && (
           <p role="status" className="text-sm text-ok">
             {note}

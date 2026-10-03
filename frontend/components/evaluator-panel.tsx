@@ -9,6 +9,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { evaluateCandidate, evaluationStreamUrl, runEventsUrl } from "@/lib/api";
 import type { Candidate, EvaluationResult } from "@/lib/types";
 
+// Ready-made interview notes so a tester can try the evaluation without writing any.
+const SAMPLE_NOTES_STRONG =
+  "Strong technical interview. Explained RAG design clearly, including hybrid search with a vector database, and described a multi-agent workflow built with CrewAI. Solid FastAPI and SQL knowledge and answered follow-up questions confidently. Communicated clearly with concrete examples from past projects. Minor gap in Docker deployment, but learns quickly. Would be a good addition to the team.";
+const SAMPLE_NOTES_WEAK =
+  "Struggled with basic Python questions. Could not explain how embeddings or vector search work. Answers about past projects were vague, with little hands-on experience of the tools in the job description. Communication was fine, but the technical depth is not there yet. Not ready for this role.";
+
 export function EvaluatorPanel({
   candidate,
   onEvaluating,
@@ -26,6 +32,7 @@ export function EvaluatorPanel({
   const evalEsRef = useRef<EventSource | null>(null);
 
   const email = candidate?.candidate_email ?? null;
+  const displayName = candidate ? candidate.name || candidate.candidate_email : "";
 
   useEffect(() => {
     setNotes("");
@@ -123,11 +130,16 @@ export function EvaluatorPanel({
         <CardTitle>Final evaluation</CardTitle>
         <CardDescription>
           {candidate
-            ? `Add your interview notes for ${candidate.name || candidate.candidate_email}.`
-            : "Select a candidate with Evaluate to add interview notes."}
+            ? `Evaluating ${displayName}. Write your interview notes, or click one of the sample notes buttons below.`
+            : "No candidate is ready yet. Finish steps 1 to 4 above (the candidate with a booked interview is selected automatically), or click Evaluate on any candidate in the table."}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
+        {candidate && (
+          <p className="text-sm text-white/80">
+            Selected candidate: <span className="font-medium text-white">{displayName}</span>
+          </p>
+        )}
         <Textarea
           aria-label="Interview notes"
           placeholder="What stood out in the interview? Strengths, concerns, anything the resume did not show."
@@ -135,10 +147,32 @@ export function EvaluatorPanel({
           onChange={(e) => setNotes(e.target.value)}
           disabled={!candidate || busy}
         />
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm text-mute">No notes handy?</span>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setNotes(SAMPLE_NOTES_STRONG)}
+            disabled={!candidate || busy}
+          >
+            Use sample notes (strong)
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setNotes(SAMPLE_NOTES_WEAK)}
+            disabled={!candidate || busy}
+          >
+            Use sample notes (weak)
+          </Button>
+        </div>
         <Button onClick={submit} disabled={!candidate || busy || !notes.trim()}>
           {busy && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}
           {busy ? "Evaluating" : "Get recommendation"}
         </Button>
+        {candidate && !notes.trim() && !busy && (
+          <p className="text-sm text-mute">Click a sample notes button or type notes, then click Get recommendation.</p>
+        )}
 
         {error && (
           <p role="alert" className="break-words text-sm text-bad">

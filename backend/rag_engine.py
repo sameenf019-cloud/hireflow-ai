@@ -25,14 +25,20 @@ _collection_lock = threading.Lock()
 
 
 def extract_text(path: str | Path) -> str:
-    """Extract plain text from a PDF (PyMuPDF), DOCX (python-docx) or TXT file."""
+    """Extract plain text from a PDF (PyMuPDF, pypdf fallback), DOCX (python-docx) or TXT file."""
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        import fitz  # PyMuPDF
+        try:
+            import fitz  # PyMuPDF
 
-        with fitz.open(path) as doc:
-            text = "\n".join(page.get_text("text") for page in doc)
+            with fitz.open(path) as doc:
+                text = "\n".join(page.get_text("text") for page in doc)
+        except ImportError:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(path))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
     elif suffix == ".docx":
         from docx import Document
 

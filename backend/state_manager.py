@@ -117,6 +117,11 @@ def get_conn():
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA_SQL)
+        # Columns the orchestrator needs that the first schema did not have.
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)")}
+        for col in ("emailed_at", "scheduled_at", "last_reply_id"):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} TEXT")
 
 
 def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
@@ -219,6 +224,29 @@ def list_candidates(
     query += " ORDER BY COALESCE(match_score, -1) DESC, id ASC"
     with get_conn() as conn:
         return [_row_to_dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+UPDATABLE_COLUMNS = {
+    "name", "match_score", "screening_json", "outreach_json", "scheduling_json",
+    "evaluation_json", "interview_notes", "gmail_thread_id", "last_processed_message_id",
+    "calendar_event_id", "calendar_event_link", "agreed_timestamp",
+    "emailed_at", "scheduled_at", "last_reply_id",
+}
+
+
+def update_candidate_fields(candidate_id: int, **fields: Any) -> None:
+    """Generic column updater used by the orchestrator (whitelisted column names only)."""
+    bad = set(fields) - UPDATABLE_COLUMNS
+    if bad:
+        raise ValueError(f"Cannot update unknown column(s): {', '.join(sorted(bad))}")
+    if not fields:
+        return
+    fields["updated_at"] = _now()
+    assignments = ", ".join(f"{k} = ?" for k in fields)
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE candidates SET {assignments} WHERE id = ?", (*fields.values(), candidate_id)
+        )
 
 
 # ---------------------------------------------------------------- status

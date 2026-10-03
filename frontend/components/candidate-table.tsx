@@ -9,6 +9,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import type { Candidate } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+// Must match SHORTLIST_THRESHOLD in the backend (default 70).
+const SHORTLIST_THRESHOLD = 70;
+
 const STATUS_LABEL: Record<string, string> = {
   PENDING_SCREENING: "Waiting for screening",
   SCREENED: "Screened",
@@ -17,10 +20,23 @@ const STATUS_LABEL: Record<string, string> = {
   RESCHEDULE_REQUESTED: "Reschedule requested",
 };
 
-function statusVariant(status: string): NonNullable<BadgeProps["variant"]> {
-  if (status === "INTERVIEW_SCHEDULED") return "success";
-  if (status === "RESCHEDULE_REQUESTED") return "warn";
-  if (status === "SCREENED" || status === "EMAILED_PENDING_REPLY") return "default";
+// A candidate is "rejected" when screening finished but they were not shortlisted.
+// Uses screening_decision if the backend sends it, otherwise falls back to the score.
+function isRejected(candidate: Candidate): boolean {
+  if (candidate.status !== "SCREENED") return false;
+  if (candidate.screening_decision) return candidate.screening_decision === "REJECT";
+  return typeof candidate.match_score === "number" && candidate.match_score < SHORTLIST_THRESHOLD;
+}
+
+function statusLabel(candidate: Candidate): string {
+  if (isRejected(candidate)) return "Rejected";
+  return STATUS_LABEL[candidate.status] ?? candidate.status;
+}
+
+function statusVariant(candidate: Candidate): NonNullable<BadgeProps["variant"]> {
+  if (isRejected(candidate)) return "danger";
+  if (candidate.status === "INTERVIEW_SCHEDULED") return "success";
+  if (candidate.status === "RESCHEDULE_REQUESTED") return "warn";
   return "default";
 }
 
@@ -34,6 +50,12 @@ function formatTime(iso?: string | null) {
   if (!iso) return null;
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+// In mock mode the backend creates fake links like
+// https://calendar.google.com/calendar/mock/event/<id> which 404 on Google.
+function isMockLink(link?: string | null): boolean {
+  return !!link && link.includes("/mock/");
 }
 
 function CandidateRow({
@@ -52,6 +74,7 @@ function CandidateRow({
   const matched = candidate.matched_skills ?? [];
   const missing = candidate.missing_skills ?? [];
   const when = formatTime(candidate.agreed_timestamp);
+  const mockLink = isMockLink(candidate.calendar_event_link);
 
   return (
     <li
@@ -66,7 +89,7 @@ function CandidateRow({
           {candidate.name && <p className="truncate text-xs text-mute">{candidate.candidate_email}</p>}
         </div>
 
-        <Badge variant={statusVariant(candidate.status)}>{STATUS_LABEL[candidate.status] ?? candidate.status}</Badge>
+        <Badge variant={statusVariant(candidate)}>{statusLabel(candidate)}</Badge>
 
         {hasScore ? (
           <div
@@ -107,16 +130,19 @@ function CandidateRow({
               {when}
             </span>
           )}
-          {candidate.calendar_event_link && (
-            <a
-              href={candidate.calendar_event_link}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 text-signal underline-offset-2 hover:underline"
-            >
-              Open calendar event <ExternalLink className="h-3 w-3" aria-hidden />
-            </a>
-          )}
+          {candidate.calendar_event_link &&
+            (mockLink ? (
+              <span className="inline-flex items-center gap-1">Demo mode: simulated calendar event</span>
+            ) : (
+              <a
+                href={candidate.calendar_event_link}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-signal underline-offset-2 hover:underline"
+              >
+                Open calendar event <ExternalLink className="h-3 w-3" aria-hidden />
+              </a>
+            ))}
         </div>
       )}
 

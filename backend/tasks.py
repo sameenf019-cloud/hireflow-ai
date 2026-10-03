@@ -2,24 +2,36 @@
 tasks.py — CrewAI task factories. Every task sets output_pydantic so each
 agent hands the next stage validated, typed data.
 
+EXCEPTION: scheduling_task does NOT use output_pydantic. CrewAI's pydantic
+converter calls Groq through instructor in tool-call mode, and Groq models
+often answer with plain JSON instead of a tool call, which raises
+"Tool choice is required, but model did not call a tool". Instead the Scheduling
+agent returns plain JSON text and orchestrator.py parses it itself.
+
 Outreach is a ConditionalTask: it only runs when the screening task's
-output says SHORTLIST (stage 3 of the workflow).
+output says SHORTLIST (stage 3 of the workflow). The Outreach agent only
+WRITES the email; orchestrator.py sends it.
+
+Scheduling: the agent has NO tools. It only reads the candidate's reply
+text (handed to it below) and extracts proposed interview time(s) as plain
+JSON. orchestrator.py then checks calendar FreeBusy and books the event with
+plain Python (tools.google_calendar).
 """
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional
+from typing import Callable, List, Literal, Optional
 
 from crewai import Agent, Task
 from crewai.tasks.conditional_task import ConditionalTask
 from crewai.tasks.task_output import TaskOutput
+from pydantic import BaseModel, Field
 
 import config
 from schemas import (
     CandidateScreeningSchema,
     EvaluationSchema,
     OutreachSchema,
-    SchedulingSchema,
 )
 
 
@@ -55,22 +67,47 @@ def screening_task(
     jd_text: str,
     callback: TaskCallback = None,
 ) -> Task:
+    import rag_engine
+    import state_manager as db
+
+    _cand = db.get_candidate_by_email(candidate_email)
+    candidate_id = _cand["id"] if _cand else None
+    resume_text = (_cand or {}).get("resume_text") or ""
+
+    # Preferred: hybrid retrieval (Qdrant + FastEmbed). Fallback: the full resume
+    # text stored in SQLite, used when retrieval fails (e.g. onnxruntime DLL error).
+    try:
+        evidence = rag_engine.build_screening_context(candidate_id, jd_text) if candidate_id else ""
+    except Exception as exc:
+        print(f"[DEBUG] retrieval failed, using stored resume text: {exc}", flush=True)
+        evidence = ""
+    if not evidence:
+        evidence = resume_text
+    if not evidence:
+        evidence = "No resume passages found for this candidate."
+
+    print(f"[DEBUG] candidate_id={candidate_id} evidence_len={len(evidence)}", flush=True)
+    print("[DEBUG] evidence_start=" + evidence[:300].replace("\n", " | "), flush=True)
+
     description = f"""
 Screen the candidate whose email is: {candidate_email}
+Their database candidate_id is: {candidate_id}
 
 JOB DESCRIPTION
 ---
 {_safe(jd_text)}
 ---
 
+RESUME EVIDENCE (text from this candidate's resume)
+---
+{_safe(evidence, 7000)}
+---
+
 Follow these steps:
 1. List the JD's must-have requirements (hard skills, tools, years of
    experience) and its nice-to-haves.
-2. Use the Resume Search tool, restricted to this candidate ({candidate_email}).
-   Run a separate query for EACH must-have requirement (exact tool/keyword
-   names like "PostgreSQL" or "Kubernetes"), plus one query for overall
-   experience themes. Do not rely on a single broad query.
-3. A skill counts as matched ONLY if the retrieved resume text shows it.
+2. Check each requirement against the RESUME EVIDENCE above. You have no tools; use only that evidence.
+3. A skill counts as matched ONLY if the resume evidence shows it.
    Never infer or invent skills.
 4. match_score (0-100): 60 points must-have coverage, 25 points depth and
    relevance of experience, 15 points nice-to-haves.
@@ -94,7 +131,8 @@ Set candidate_email to exactly: {candidate_email}
 
 
 # --------------------------------------------------------------------------
-# Stage 3 — Outreach (conditional on SHORTLIST)
+# Stage 3 — Outreach (conditional on SHORTLIST). The agent only WRITES the
+# email; orchestrator.py sends it.
 # --------------------------------------------------------------------------
 def _is_shortlist(output: TaskOutput) -> bool:
     parsed = getattr(output, "pydantic", None)
@@ -126,13 +164,14 @@ def outreach_task(
     greeting = candidate_name or "the candidate"
 
     description = f"""
-Write and send an interview invitation to {greeting} <{candidate_email}>
-on behalf of {COMPANY_NAME}.
+Write an interview invitation email to {greeting} <{candidate_email}>
+on behalf of {COMPANY_NAME}. You do NOT send it and you have no tools:
+the system sends the email after you finish.
 
 {screening_block}
 
 Email requirements:
-- Subject line plus a body of roughly 120-170 words, friendly and professional.
+- A subject line plus a body of roughly 120-170 words, friendly and professional.
 - Mention 2-3 SPECIFIC strengths taken from matched_skills so it feels personal.
 - Do NOT mention the match score or any missing skills.
 - Invite them to a {INTERVIEW_MINUTES}-minute interview and ask them to reply
@@ -140,20 +179,19 @@ Email requirements:
   their time zone.
 - Sign off as: {sender_name}
 
-Use the Gmail send tool exactly once, with to={candidate_email}.
-
 Output rules:
 - candidate_email = {candidate_email}
-- email_draft = the exact body text you sent
-- action_taken = "EMAIL_SENT" if the tool confirmed success, otherwise
-  "SEND_FAILED" (never claim EMAIL_SENT without a successful tool result).
+- email_draft = the full email in this exact layout: the first line is
+  "Subject: <your subject line>", then one blank line, then the email body.
+- action_taken = "SEND_FAILED" (always; the system sets the real result itself).
 """.strip()
 
     kwargs = dict(
         description=description,
         expected_output=(
-            "A JSON object with candidate_email, email_draft, and action_taken "
-            '("EMAIL_SENT" or "SEND_FAILED").'
+            "A JSON object with candidate_email, email_draft (first line "
+            '"Subject: ...", blank line, then the body), and action_taken '
+            '("SEND_FAILED").'
         ),
         agent=agent,
         output_pydantic=OutreachSchema,
@@ -172,68 +210,83 @@ Output rules:
 # --------------------------------------------------------------------------
 # Stage 4 — Scheduling (also handles reschedules)
 # --------------------------------------------------------------------------
+class SchedulingProposalSchema(BaseModel):
+    """What the Scheduling agent produces (no tools). orchestrator.py parses
+    the agent's raw JSON text into this schema itself, then checks FreeBusy
+    and books the event in plain Python."""
+
+    candidate_email: str
+    proposed_times: List[str] = Field(
+        default_factory=list,
+        description=(
+            "ISO 8601 datetimes with a UTC offset, in the order the candidate "
+            "offered them. Empty if the reply has no usable time."
+        ),
+    )
+    status: Literal["HAS_TIMES", "NEEDS_CLARIFICATION"]
+
+
 def scheduling_task(
     agent: Agent,
     candidate_email: str,
     *,
+    reply_body: str,
     now_iso: str,
     reschedule: bool = False,
     candidate_name: Optional[str] = None,
-    role_title: Optional[str] = None,
     callback: TaskCallback = None,
 ) -> Task:
     reschedule_note = ""
     if reschedule:
         reschedule_note = (
             "\nThis is a RESCHEDULE. The candidate's previous interview event "
-            "has ALREADY been cancelled. Their LATEST reply asks for a new "
-            "time. Ignore any times mentioned in older messages.\n"
+            "has ALREADY been cancelled. This reply asks for a new time.\n"
         )
 
     who = candidate_name or candidate_email
-    title = f"Interview: {who}" + (f" - {role_title}" if role_title else "")
 
     description = f"""
-Schedule an interview with {who} <{candidate_email}>.
+Read this candidate's reply and figure out what interview time(s) they are
+proposing. You have NO TOOLS - work only from the reply text below. You do
+NOT check any calendar and you do NOT book anything; that happens after you.
+
+Candidate: {who} <{candidate_email}>
 {reschedule_note}
 Current date/time: {now_iso}
-Interviewer time zone (use for all times): {INTERVIEW_TZ}
+Interviewer time zone (resolve every time into this zone): {INTERVIEW_TZ}
 Interview length: {INTERVIEW_MINUTES} minutes
 
-Steps:
-1. Use the Gmail read tool to fetch replies from {candidate_email}. Use only
-   the MOST RECENT reply.
-2. Extract the time(s) the candidate proposes and resolve them to absolute
-   start/end datetimes in {INTERVIEW_TZ} (relative words like "Tuesday
-   afternoon" are relative to the current date/time above). If the candidate
-   gave a time zone, convert it.
-3. For each proposed slot, in the order offered, use the Calendar FreeBusy tool
-   to check that exact window. Pick the first slot that is free.
-4. Use the Calendar event-insert tool to book it: title "{title}", the
-   candidate ({candidate_email}) as attendee, a Google Meet link, duration
-   {INTERVIEW_MINUTES} minutes.
-5. Never book a slot you did not FreeBusy-check, and never invent a time the
-   candidate did not offer.
+CANDIDATE'S REPLY
+---
+{_safe(reply_body, 3000)}
+---
 
-Set status to exactly one of:
-- "SCHEDULED"            event was created (set agreed_timestamp = start time
-                         in ISO 8601 with UTC offset, and calendar_event_link)
-- "NO_REPLY"             no reply from the candidate was found
-- "NEEDS_CLARIFICATION"  the reply contains no usable time
-- "NO_SLOT"              every proposed time is busy
-For any status other than SCHEDULED, set agreed_timestamp and
-calendar_event_link to an empty string "".
-candidate_email = {candidate_email}
+Steps:
+1. Find every time the candidate proposes (they may offer more than one).
+   Resolve relative words like "Tuesday afternoon" or "next week" relative
+   to the current date/time above. If the candidate gave their own time
+   zone, convert it to {INTERVIEW_TZ}.
+2. List them in proposed_times, in the order the candidate offered them,
+   each as a full ISO 8601 datetime WITH a UTC offset
+   (e.g. 2026-10-06T14:00:00+05:00).
+3. If the reply contains no usable time at all, leave proposed_times empty.
+
+Set status to "HAS_TIMES" if proposed_times is non-empty, otherwise
+"NEEDS_CLARIFICATION".
+Set candidate_email to exactly: {candidate_email}
+
+Respond with ONLY the JSON object. No prose, no markdown, no code fences.
 """.strip()
 
+    # NOTE: no output_pydantic here on purpose (see module docstring).
     return Task(
         description=description,
         expected_output=(
-            "A JSON object with candidate_email, agreed_timestamp (ISO 8601), "
-            "calendar_event_link, and status."
+            "ONLY a JSON object with candidate_email, proposed_times (list of "
+            "ISO 8601 datetimes with UTC offset, in the order offered), and "
+            'status ("HAS_TIMES" or "NEEDS_CLARIFICATION").'
         ),
         agent=agent,
-        output_pydantic=SchedulingSchema,
         callback=callback,
     )
 

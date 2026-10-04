@@ -2,6 +2,13 @@
 
 A multi-agent recruitment pipeline. Upload a job description and a stack of resumes. HireFlow screens each candidate, emails the shortlist, books interviews on your calendar, and gives a hire or reject recommendation after the interview.
 
+
+## Live Demo
+
+**[https://hireflow-ai-rho-tawny.vercel.app](https://hireflow-ai-rho-tawny.vercel.app)**
+
+No setup needed — the app above runs in demo (mock) mode. Click **"Try with sample data"**, then follow the steps in **"For judges"** below.
+
 ## Agents
 
 1. **Ingestion** — parses and indexes the job description and resumes

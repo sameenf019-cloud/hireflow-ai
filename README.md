@@ -8,7 +8,9 @@ A multi-agent recruitment pipeline. Upload a job description and a stack of resu
 **[https://hireflow-ai-rho-tawny.vercel.app](https://hireflow-ai-rho-tawny.vercel.app)**
 
 No setup needed — the app above runs in demo (mock) mode. Click **"Try with sample data"**, then follow the steps in **"For judges"** below.
+## Source Code
 
+**[https://github.com/sameenf019-cloud/hireflow-ai](https://github.com/sameenf019-cloud/hireflow-ai)**
 ## Agents
 
 1. **Ingestion** — parses and indexes the job description and resumes
